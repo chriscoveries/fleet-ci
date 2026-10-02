@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""gh-poll — deterministic GitHub CI/CD sweeper for the fleet.
+
+One pass, no model, exits 0. Per configured repo:
+  * list open PRs; for each PR compute mergeability = CI green on head sha
+    AND (optionally) a REVIEW: PASS comment matching the head sha prefix;
+    squash-merge the ones that pass.
+  * check CI on the default branch; if the latest run is red and no open
+    issue tracks it, file one.
+
+Config: env GH_TOKEN (required), one repo per line in the repos file.
+  gh-poll --repos repos.txt [--require-pass] [--dry-run]
+
+One line per action on stdout; nothing else. Idempotent: a PR merged once
+is gone, a red issue filed once is found by title search and not refiled.
+"""
+import json, os, re, sys, urllib.request, urllib.error
+
+API = "https://api.github.com"
+TOKEN = os.environ.get("GH_TOKEN") or os.environ.get("gitHUB_chriscoveries") or ""
+
+
+def gh(method, path, body=None, query=""):
+    req = urllib.request.Request(
+        f"{API}{path}{query}", method=method,
+        headers={"Authorization": f"Bearer {TOKEN}",
+                 "Accept": "application/vnd.github+json",
+                 "X-GitHub-Api-Version": "2022-11-28"},
+        data=json.dumps(body).encode() if body is not None else None)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+            return r.status, json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        return e.code, {}
+
+
+def checks_green(repo, sha):
+    _, runs = gh("GET", f"/repos/{repo}/commits/{sha}/check-runs",
+                 query="?per_page=100")
+    runs = runs.get("check_runs") or []
+    if not runs:
+        return False
+    done = [r for r in runs if r["status"] == "completed"]
+    if len(done) != len(runs):
+        return False
+    return all(r.get("conclusion") in ("success", "skipped", "neutral")
+               for r in runs)
+
+
+def has_pass(repo, number, sha):
+    _, comments = gh("GET", f"/repos/{repo}/issues/{number}/comments",
+                     query="?per_page=100")
+    needle = f"REVIEW: PASS {sha[:8]}"
+    return any(needle in (c.get("body") or "") for c in comments or [])
+
+
+def latest_run_red(repo):
+    _, runs = gh("GET", f"/repos/{repo}/actions/runs",
+                 query="?per_page=1&branch=main&event=push&status=completed")
+    runs = runs.get("workflow_runs") or []
+    return runs[0] if runs and runs[0].get("conclusion") == "failure" else None
+
+
+def sweep(repo, require_pass, dry):
+    _, prs = gh("GET", f"/repos/{repo}/pulls", query="?state=open&per_page=50")
+    for pr in prs or []:
+        n, sha, mergeable = pr["number"], pr["head"]["sha"], pr.get("mergeable")
+        if mergeable is False:
+            print(f"{repo}#{n} conflict — skipped"); continue
+        if not checks_green(repo, sha):
+            continue
+        if require_pass and not has_pass(repo, n, sha):
+            print(f"{repo}#{n} green, no PASS — skipped"); continue
+        if dry:
+            print(f"{repo}#{n} would merge {sha[:8]}"); continue
+        code, out = gh("PUT", f"/repos/{repo}/pulls/{n}/merge",
+                       {"merge_method": "squash"})
+        print(f"{repo}#{n} merged {sha[:8]}" if code == 200
+              else f"{repo}#{n} merge failed {code}")
+    run = latest_run_red(repo)
+    if run:
+        title = f"CI red on main @ {run['head_sha'][:7]}"
+        _, res = gh("GET", f"/repos/{repo}/issues",
+                    query=f"?state=open&per_page=50")
+        if not any(title in (i.get("title") or "") for i in res or []):
+            if dry:
+                print(f"{repo} red main — would file: {title}")
+            else:
+                gh("POST", f"/repos/{repo}/issues", {"title": title,
+                   "body": f"main run {run['id']} red:\n{run['html_url']}"})
+                print(f"{repo} filed: {title}")
+
+
+def main(argv):
+    repos_f, require_pass, dry = None, False, False
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--repos":
+            i += 1; repos_f = argv[i]
+        elif a == "--require-pass":
+            require_pass = True
+        elif a == "--dry-run":
+            dry = True
+        i += 1
+    if not repos_f or not TOKEN:
+        print(__doc__.strip().splitlines()[0],
+              "needs --repos <file> and GH_TOKEN", file=sys.stderr)
+        return 2
+    for line in open(repos_f):
+        repo = line.strip()
+        if repo and not repo.startswith("#"):
+            sweep(repo, require_pass, dry)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
